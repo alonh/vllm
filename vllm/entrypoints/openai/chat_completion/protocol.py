@@ -88,6 +88,34 @@ class ChatCompletionLogProbs(OpenAIBaseModel):
     content: list[ChatCompletionLogProbsContent] | None = None
 
 
+class FollowupResponse(OpenAIBaseModel):
+    """A follow-up response in a sequential or parallel chain."""
+    
+    message: ChatMessage = Field(
+        description="The assistant's response message"
+    )
+    
+    logprobs: ChatCompletionLogProbs | None = Field(
+        default=None,
+        description="Log probability information for the response"
+    )
+    
+    finish_reason: str | None = Field(
+        default="stop",
+        description="The reason the model stopped generating tokens"
+    )
+    
+    stop_reason: int | str | None = Field(
+        default=None,
+        description="The stop reason (vLLM-specific)"
+    )
+    
+    token_ids: list[int] | None = Field(
+        default=None,
+        description="Token IDs for this response (if requested)"
+    )
+
+
 class ChatCompletionResponseChoice(OpenAIBaseModel):
     index: int
     message: ChatMessage
@@ -99,6 +127,23 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     # not part of the OpenAI spec but is useful for tracing the tokens
     # in agent scenarios
     token_ids: list[int] | None = None
+    
+    # Follow-up responses
+    sequential_followups: list[FollowupResponse] | None = Field(
+        default=None,
+        description=(
+            "Sequential follow-up responses. Each element represents an LLM response "
+            "in the sequence."
+        )
+    )
+    
+    parallel_followups: list[FollowupResponse] | None = Field(
+        default=None,
+        description=(
+            "Parallel independent follow-up responses. Each element represents "
+            "an independent response corresponding to the input prallel message."
+        )
+    )
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -152,6 +197,48 @@ class ChatCompletionNamedFunction(OpenAIBaseModel):
 class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
     function: ChatCompletionNamedFunction
     type: Literal["function"] = "function"
+
+
+class FollowupParams(OpenAIBaseModel):
+    """Parameters for follow-up request execution with sequential or parallel modes."""
+    
+    sequential_messages: list[list[ChatCompletionMessageParam]] | None = Field(
+        default=None,
+        description=(
+            "Sequential follow-up mode: Each message list is appended after the "
+            "previous response, creating a linear conversation where each turn "
+            "builds on all previous turns. "
+            "Execution: step1: initial_input_messages → r1, "
+            "step2: initial_input_messages + [r1] + sequential_messages[0] → r2,"
+            "step3: initial_input_messages + [r1] + sequential_messages[0] + [r2] + sequential_messages[1] → r3."
+            "All intermediate responses are returned in ChatCompletionResponseChoice.sequential_followups."
+        )
+    )
+    
+    parallel_messages: list[list[ChatCompletionMessageParam]] | None = Field(
+        default=None,
+        description=(
+            "Parallel independent mode: Each message list independently follows "
+            "only the initial response. "
+            "Execution: initial_input_messages → r1, then "
+            "initial_input_messages + [r1] + parallel_messages[0]→r2a,"
+            "initial_input_messages + [r1] + parallel_messages[1]→r2b."
+            "All parallel responses are returned in ChatCompletionResponseChoice.parallel_followups."
+        )
+    )
+    
+    @model_validator(mode="after")
+    def check_exclusive(self):
+        """Ensure exactly one mode is used."""
+        if self.sequential_messages and self.parallel_messages:
+            raise ValueError(
+                "Cannot use both sequential_messages and parallel_messages simultaneously"
+            )
+        if not self.sequential_messages and not self.parallel_messages:
+            raise ValueError(
+                "Must provide either sequential_messages or parallel_messages"
+            )
+        return self
 
 
 class ChatCompletionRequest(OpenAIBaseModel):
@@ -345,6 +432,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
         default=None,
         description="KVTransfer parameters used for disaggregated serving.",
     )
+    
+    followup_params: FollowupParams | None = Field(
+        default=None,
+        description=(
+            "Parameters for follow-up request execution. Enables multi-turn "
+            "conversations with sequential or parallel independent modes."
+        )
+    )
 
     vllm_xargs: dict[str, str | int | float | list[str | int | float]] | None = Field(
         default=None,
@@ -353,6 +448,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "numeric values, used by custom extensions."
         ),
     )
+
 
     # --8<-- [end:chat-completion-extra-params]
 

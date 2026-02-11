@@ -34,6 +34,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse,
     ChatMessage,
+    FollowupResponse,
 )
 from vllm.entrypoints.openai.chat_completion.stream_harmony import (
     TokenState,
@@ -69,7 +70,6 @@ from vllm.entrypoints.utils import get_max_tokens, should_include_usage
 from vllm.inputs.data import TokensPrompt
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
-from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
@@ -350,48 +350,21 @@ class OpenAIServingChat(OpenAIServing):
         # Extract data_parallel_rank from header (router can inject it)
         data_parallel_rank = self._get_data_parallel_rank(raw_request)
 
-        # Check for chained generation in vllm_xargs
-        vllm_xargs = request.vllm_xargs or {}
-        after_generation_messages = vllm_xargs.get('after_generation_messages')
-        
-        if after_generation_messages:
+        # Check if followup_params parameter is set
+        if request.followup_params is not None:
             if request.stream:
                 return self.create_error_response(
-                    "Streaming is not yet supported with after_generation_messages. "
+                    "Streaming is not yet supported with followup requests. "
                     "Please set stream=False."
                 )
             
-            # Parse after_generation_messages if it's a JSON string
-            if isinstance(after_generation_messages, str):
-                try:
-                    after_generation_messages = json.loads(after_generation_messages)
-                except json.JSONDecodeError as e:
-                    return self.create_error_response(
-                        f"Invalid after_generation_messages JSON: {e}"
-                    )
-            
-            # Ensure it's a list
-            if not isinstance(after_generation_messages, list):
-                return self.create_error_response(
-                    "after_generation_messages must be a list of messages"
-                )
-            
-            # Extract other chained generation parameters
-            max_chained_turns = int(vllm_xargs.get('max_chained_turns', 10))
-            return_intermediate_outputs = bool(
-                vllm_xargs.get('return_intermediate_outputs', True)
-            )
-            
-            return await self._create_chained_chat_completion(
+            return await self._create_followup_chat_completion(
                 request=request,
                 raw_request=raw_request,
                 tokenizer=tokenizer,
                 model_name=model_name,
                 lora_request=lora_request,
                 data_parallel_rank=data_parallel_rank,
-                after_generation_messages=after_generation_messages,
-                max_chained_turns=max_chained_turns,
-                return_intermediate_outputs=return_intermediate_outputs,
             )
 
         # Schedule the request and get the result generator.
@@ -513,187 +486,382 @@ class OpenAIServingChat(OpenAIServing):
         if request.add_generation_prompt:
             return self.response_role
 
-    async def _create_chained_chat_completion(
+    async def _create_followup_chat_completion(
         self,
         request: ChatCompletionRequest,
         raw_request: Request | None,
-        tokenizer: TokenizerLike,
+        tokenizer,
         model_name: str,
-        lora_request: LoRARequest | None,
+        lora_request,
         data_parallel_rank: int | None,
-        after_generation_messages: list,
-        max_chained_turns: int,
-        return_intermediate_outputs: bool,
     ) -> ChatCompletionResponse | ErrorResponse:
         """
-        Execute chained chat completions by iteratively:
-        1. Generate response for current messages
-        2. Append assistant response to conversation
-        3. Append next user message from after_generation_messages
-        4. Repeat until all messages processed or max_turns reached
+        Execute follow-up chat completions in sequential or parallel mode.
         """
+        followup_params = request.followup_params
         
-        conversation_history = list(request.messages)  # Copy original messages
-        all_outputs = []
+        if followup_params.sequential_messages:
+            return await self._handle_sequential_followups(
+                request=request,
+                raw_request=raw_request,
+                tokenizer=tokenizer,
+                model_name=model_name,
+                lora_request=lora_request,
+                data_parallel_rank=data_parallel_rank,
+                sequential_messages=followup_params.sequential_messages,
+            )
+        else:  # parallel_messages
+            return await self._handle_parallel_followups(
+                request=request,
+                raw_request=raw_request,
+                tokenizer=tokenizer,
+                model_name=model_name,
+                lora_request=lora_request,
+                data_parallel_rank=data_parallel_rank,
+                parallel_messages=followup_params.parallel_messages,
+            )
+
+    async def _handle_sequential_followups(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Request | None,
+        tokenizer,
+        model_name: str,
+        lora_request,
+        data_parallel_rank: int | None,
+        sequential_messages: list,
+    ) -> ChatCompletionResponse | ErrorResponse:
+        """Handle sequential follow-up messages."""
+        
+        conversation_history = list(request.messages)
+        all_responses = []
         total_prompt_tokens = 0
         total_completion_tokens = 0
         
-        # Process initial generation + each after_generation_message
-        messages_to_process = [None] + (after_generation_messages or [])
+        # Generate initial response
+        initial_output = await self._generate_single_turn(
+            request=request,
+            messages=conversation_history,
+            tokenizer=tokenizer,
+            lora_request=lora_request,
+            data_parallel_rank=data_parallel_rank,
+        )
         
-        for turn_idx, next_message in enumerate(messages_to_process):
-            if turn_idx >= max_chained_turns:
-                logger.warning(
-                    f"Reached max_chained_turns={max_chained_turns}, "
-                    f"stopping at turn {turn_idx}"
-                )
-                break
+        if isinstance(initial_output, ErrorResponse):
+            return initial_output
+        
+        all_responses.append(initial_output)
+        total_prompt_tokens += len(initial_output["prompt_token_ids"])
+        total_completion_tokens += len(initial_output["output_token_ids"])
+        
+        # Add initial response to conversation
+        conversation_history.append({
+            "role": "assistant",
+            "content": initial_output["text"],
+        })
+        
+        # Process sequential follow-ups
+        for follow_up_msgs in sequential_messages:
+            # Add follow-up messages to conversation
+            conversation_history.extend(follow_up_msgs)
             
-            # Add the next message to conversation history BEFORE processing this turn
-            # (skip the first None which represents the initial turn)
-            if next_message is not None:
-                conversation_history.append(next_message)
-            
-            # Create a modified request for this turn
-            turn_request = request.model_copy(deep=True)
-            turn_request.messages = conversation_history
-            turn_request.stream = False
-            turn_request.after_generation_messages = None  # Prevent recursion
-            
-            try:
-                # Preprocess chat for this turn
-                conversation, engine_prompts = await self._preprocess_chat(
-                    turn_request,
-                    tokenizer,
-                    conversation_history,
-                    chat_template=request.chat_template or self.chat_template,
-                    chat_template_content_format=self.chat_template_content_format,
-                    add_generation_prompt=request.add_generation_prompt,
-                    continue_final_message=False,
-                    tool_dicts=None,  # Simplified for initial implementation
-                    documents=request.documents,
-                    chat_template_kwargs=request.chat_template_kwargs or {},
-                    default_chat_template_kwargs=self.default_chat_template_kwargs,
-                    tool_parser=self.tool_parser,
-                    add_special_tokens=request.add_special_tokens,
-                )
-            except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
-                logger.exception(f"Error in preprocessing turn {turn_idx}")
-                return self.create_error_response(f"Turn {turn_idx} preprocessing error: {e}")
-            
-            # Generate using existing engine
-            engine_prompt = engine_prompts[0]
-            sub_request_id = f"{request.request_id}_turn_{turn_idx}"
-            
-            if self.default_sampling_params is None:
-                self.default_sampling_params = {}
-            
-            max_tokens = get_max_tokens(
-                max_model_len=self.max_model_len,
-                request=turn_request,
-                input_length=len(engine_prompt["prompt_token_ids"]),
-                default_sampling_params=self.default_sampling_params,
+            # Generate response
+            output = await self._generate_single_turn(
+                request=request,
+                messages=conversation_history,
+                tokenizer=tokenizer,
+                lora_request=lora_request,
+                data_parallel_rank=data_parallel_rank,
             )
             
-            sampling_params: SamplingParams | BeamSearchParams
-            if turn_request.use_beam_search:
-                sampling_params = turn_request.to_beam_search_params(
-                    max_tokens, self.default_sampling_params
-                )
-            else:
-                sampling_params = turn_request.to_sampling_params(
-                    max_tokens,
-                    self.model_config.logits_processor_pattern,
-                    self.default_sampling_params,
-                )
+            if isinstance(output, ErrorResponse):
+                return output
             
-            try:
-                engine_request, tokenization_kwargs = await self._process_inputs(
-                    sub_request_id,
-                    engine_prompt,
-                    sampling_params,
-                    lora_request=lora_request,
-                    trace_headers=None,
-                    priority=request.priority,
-                    data_parallel_rank=data_parallel_rank,
-                )
-                
-                # Generate and collect full output
-                prompt_text, _, _ = self._get_prompt_components(engine_prompt)
-                generator = self.engine_client.generate(
-                    engine_request,
-                    sampling_params,
-                    sub_request_id,
-                    lora_request=lora_request,
-                    priority=request.priority,
-                    prompt_text=prompt_text,
-                    tokenization_kwargs=tokenization_kwargs,
-                    data_parallel_rank=data_parallel_rank,
-                )
-                
-                # Consume generator to get final output
-                final_output = None
-                async for output in generator:
-                    final_output = output
-                
-                if final_output is None:
-                    return self.create_error_response(
-                        f"No output generated for turn {turn_idx}"
-                    )
-                
-            except ValueError as e:
-                logger.exception(f"Error generating turn {turn_idx}")
-                return self.create_error_response(f"Turn {turn_idx} generation error: {e}")
+            all_responses.append(output)
+            total_prompt_tokens += len(output["prompt_token_ids"])
+            total_completion_tokens += len(output["output_token_ids"])
             
-            # Extract assistant response
-            assistant_text = final_output.outputs[0].text
-            
-            # Store output for this turn
-            all_outputs.append({
-                "turn": turn_idx,
-                "output": final_output,
-                "assistant_message": assistant_text,
-            })
-            
-            # Update conversation history with assistant response
+            # Add response to conversation
             conversation_history.append({
                 "role": "assistant",
-                "content": assistant_text,
+                "content": output["text"],
             })
-            
-            # Track tokens
-            total_prompt_tokens += len(final_output.prompt_token_ids)
-            total_completion_tokens += len(final_output.outputs[0].token_ids)
         
-        # Format response based on return_intermediate_outputs flag
-        if return_intermediate_outputs:
-            # Return all turns as separate choices
-            choices = []
-            for idx, turn_data in enumerate(all_outputs):
-                choices.append(ChatCompletionResponseChoice(
-                    index=idx,
-                    message=ChatMessage(
-                        role="assistant",
-                        content=turn_data["assistant_message"],
-                    ),
-                    finish_reason=turn_data["output"].outputs[0].finish_reason,
-                ))
+        # Format response - always return all outputs
+        return self._format_sequential_response(
+            all_responses=all_responses,
+            model_name=model_name,
+            request_id=request.request_id,
+            total_prompt_tokens=total_prompt_tokens,
+            total_completion_tokens=total_completion_tokens,
+            request=request,
+        )
+
+    async def _handle_parallel_followups(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Request | None,
+        tokenizer,
+        model_name: str,
+        lora_request,
+        data_parallel_rank: int | None,
+        parallel_messages: list,
+    ) -> ChatCompletionResponse | ErrorResponse:
+        """Handle parallel independent follow-up messages."""
+        
+        # Generate initial response
+        initial_output = await self._generate_single_turn(
+            request=request,
+            messages=request.messages,
+            tokenizer=tokenizer,
+            lora_request=lora_request,
+            data_parallel_rank=data_parallel_rank,
+        )
+        
+        if isinstance(initial_output, ErrorResponse):
+            return initial_output
+        
+        # Base conversation with initial response
+        base_history = list(request.messages) + [{
+            "role": "assistant",
+            "content": initial_output["text"],
+        }]
+        
+        total_prompt_tokens = len(initial_output["prompt_token_ids"])
+        total_completion_tokens = len(initial_output["output_token_ids"])
+        
+        # Process parallel chains (each independent)
+        parallel_responses = []
+        for parallel_msgs in parallel_messages:
+            # Create independent branch
+            branch_history = base_history + parallel_msgs
+            
+            # Generate response
+            output = await self._generate_single_turn(
+                request=request,
+                messages=branch_history,
+                tokenizer=tokenizer,
+                lora_request=lora_request,
+                data_parallel_rank=data_parallel_rank,
+            )
+            
+            if isinstance(output, ErrorResponse):
+                return output
+            
+            parallel_responses.append(output)
+            total_prompt_tokens += len(output["prompt_token_ids"])
+            total_completion_tokens += len(output["output_token_ids"])
+        
+        # Format response - always return all outputs
+        return self._format_parallel_response(
+            initial_output=initial_output,
+            parallel_responses=parallel_responses,
+            model_name=model_name,
+            request_id=request.request_id,
+            total_prompt_tokens=total_prompt_tokens,
+            total_completion_tokens=total_completion_tokens,
+            request=request,
+        )
+
+    async def _generate_single_turn(
+        self,
+        request: ChatCompletionRequest,
+        messages: list,
+        tokenizer,
+        lora_request,
+        data_parallel_rank: int | None,
+    ) -> dict | ErrorResponse:
+        """Generate a single response for given messages."""
+        # Create modified request
+        turn_request = request.model_copy(deep=True)
+        turn_request.messages = messages
+        turn_request.stream = False
+        turn_request.followup_params = None  # Prevent recursion
+        
+        try:
+            # Preprocess chat
+            conversation, engine_prompts = await self._preprocess_chat(
+                turn_request,
+                tokenizer,
+                messages,
+                chat_template=request.chat_template or self.chat_template,
+                chat_template_content_format=self.chat_template_content_format,
+                add_generation_prompt=request.add_generation_prompt,
+                continue_final_message=False,
+                tool_dicts=None,
+                documents=request.documents,
+                chat_template_kwargs=request.chat_template_kwargs or {},
+                default_chat_template_kwargs=self.default_chat_template_kwargs,
+                tool_parser=self.tool_parser,
+                add_special_tokens=request.add_special_tokens,
+            )
+        except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
+            logger.exception("Error in preprocessing")
+            return self.create_error_response(f"Preprocessing error: {e}")
+        
+        engine_prompt = engine_prompts[0]
+        
+        if self.default_sampling_params is None:
+            self.default_sampling_params = {}
+        
+        max_tokens = get_max_tokens(
+            max_model_len=self.max_model_len,
+            request=turn_request,
+            input_length=len(engine_prompt["prompt_token_ids"]),
+            default_sampling_params=self.default_sampling_params,
+        )
+        
+        from vllm.sampling_params import SamplingParams, BeamSearchParams
+        sampling_params: SamplingParams | BeamSearchParams
+        if turn_request.use_beam_search:
+            sampling_params = turn_request.to_beam_search_params(
+                max_tokens, self.default_sampling_params
+            )
         else:
-            # Return only final turn
-            final_turn = all_outputs[-1]
-            choices = [ChatCompletionResponseChoice(
-                index=0,
+            sampling_params = turn_request.to_sampling_params(
+                max_tokens,
+                self.model_config.logits_processor_pattern,
+                self.default_sampling_params,
+            )
+        
+        try:
+            sub_request_id = f"{request.request_id}_turn"
+            engine_request, tokenization_kwargs = await self._process_inputs(
+                sub_request_id,
+                engine_prompt,
+                sampling_params,
+                lora_request=lora_request,
+                trace_headers=None,
+                priority=request.priority,
+                data_parallel_rank=data_parallel_rank,
+            )
+            
+            # Generate and collect full output
+            prompt_text, _, _ = self._get_prompt_components(engine_prompt)
+            generator = self.engine_client.generate(
+                engine_request,
+                sampling_params,
+                sub_request_id,
+                lora_request=lora_request,
+                priority=request.priority,
+                prompt_text=prompt_text,
+                tokenization_kwargs=tokenization_kwargs,
+                data_parallel_rank=data_parallel_rank,
+            )
+            
+            # Consume generator to get final output
+            final_output = None
+            async for output in generator:
+                final_output = output
+            
+            if final_output is None:
+                return self.create_error_response("No output generated")
+            
+            # Return structured output
+            return {
+                "text": final_output.outputs[0].text,
+                "finish_reason": final_output.outputs[0].finish_reason,
+                "prompt_token_ids": final_output.prompt_token_ids,
+                "output_token_ids": final_output.outputs[0].token_ids,
+                "logprobs": final_output.outputs[0].logprobs if request.logprobs else None,
+            }
+            
+        except ValueError as e:
+            logger.exception("Error generating turn")
+            return self.create_error_response(f"Generation error: {e}")
+
+    def _format_sequential_response(
+        self,
+        all_responses: list,
+        model_name: str,
+        request_id: str,
+        total_prompt_tokens: int,
+        total_completion_tokens: int,
+        request: ChatCompletionRequest,
+    ) -> ChatCompletionResponse:
+        """Format sequential follow-up response - always returns all outputs."""
+        
+        # Create FollowupResponse objects for all but the first
+        followup_objs = [
+            FollowupResponse(
                 message=ChatMessage(
                     role="assistant",
-                    content=final_turn["assistant_message"],
+                    content=resp["text"],
                 ),
-                finish_reason=final_turn["output"].outputs[0].finish_reason,
-            )]
+                finish_reason=resp["finish_reason"],
+                logprobs=resp.get("logprobs"),
+                token_ids=resp["output_token_ids"] if request.return_token_ids else None,
+            )
+            for resp in all_responses[1:]  # Skip initial
+        ]
+        
+        # Always return initial with all follow-ups
+        choice = ChatCompletionResponseChoice(
+            index=0,
+            message=ChatMessage(
+                role="assistant",
+                content=all_responses[0]["text"],
+            ),
+            finish_reason=all_responses[0]["finish_reason"],
+            logprobs=all_responses[0].get("logprobs"),
+            token_ids=all_responses[0]["output_token_ids"] if request.return_token_ids else None,
+            sequential_followups=followup_objs,
+        )
         
         return ChatCompletionResponse(
-            id=request.request_id,
+            id=request_id,
             model=model_name,
-            choices=choices,
+            choices=[choice],
+            usage=UsageInfo(
+                prompt_tokens=total_prompt_tokens,
+                completion_tokens=total_completion_tokens,
+                total_tokens=total_prompt_tokens + total_completion_tokens,
+            ),
+        )
+
+    def _format_parallel_response(
+        self,
+        initial_output: dict,
+        parallel_responses: list,
+        model_name: str,
+        request_id: str,
+        total_prompt_tokens: int,
+        total_completion_tokens: int,
+        request: ChatCompletionRequest,
+    ) -> ChatCompletionResponse:
+        """Format parallel follow-up response - always returns all outputs."""
+        
+        # Create FollowupResponse objects
+        followup_objs = [
+            FollowupResponse(
+                message=ChatMessage(
+                    role="assistant",
+                    content=resp["text"],
+                ),
+                finish_reason=resp["finish_reason"],
+                logprobs=resp.get("logprobs"),
+                token_ids=resp["output_token_ids"] if request.return_token_ids else None,
+            )
+            for resp in parallel_responses
+        ]
+        
+        # Always return initial with all parallel results
+        choice = ChatCompletionResponseChoice(
+            index=0,
+            message=ChatMessage(
+                role="assistant",
+                content=initial_output["text"],
+            ),
+            finish_reason=initial_output["finish_reason"],
+            logprobs=initial_output.get("logprobs"),
+            token_ids=initial_output["output_token_ids"] if request.return_token_ids else None,
+            parallel_followups=followup_objs,
+        )
+        
+        return ChatCompletionResponse(
+            id=request_id,
+            model=model_name,
+            choices=[choice],
             usage=UsageInfo(
                 prompt_tokens=total_prompt_tokens,
                 completion_tokens=total_completion_tokens,
